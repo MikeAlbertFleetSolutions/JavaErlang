@@ -63,7 +63,7 @@
 -export([set_timeout/1]).
 -export([get/2,get_static/3,set/3,set_static/4]).
 -export([is_object_ref/1]).
--export([array_to_list/1,string_to_list/1,list_to_string/2,list_to_array/3,convert/3]).
+-export([array_to_list/1,string_to_list/1,string_to_utf8/1,list_to_string/2,list_to_array/3,convert/3]).
 -export([getClassName/1,getSimpleClassName/1,instanceof/2,is_subtype/3]).
 -export([identity/1]).
 -export([print_stacktrace/1,get_stacktrace/1]).
@@ -78,7 +78,7 @@
 -export([finalComponent/1]).
 -export([find_class/1]).
 -export([node_lookup/1]).
--export([run_java/9]).
+-export([run_java/10]).
 -export([terminate_brutally/1]).
 
 -include("debug.hrl").
@@ -106,6 +106,7 @@
       | {java_options,[string()]}
       | {setcookie,string()}
       | {enable_proxies,boolean()}
+      | {return_OtpErlangObject,boolean()}
       | {call_timeout,integer() | infinity}.
 %% <ul>
 %% <li>`symbolic_name' provides a symbolic name for the node.</li>
@@ -140,6 +141,7 @@
 %% Java objects communicated to Erlang or not.</li>
 %% <li>`enable_proxies' determines whether the proxy facility provided
 %% <li>`setcookie' sets the cookie for the Java node.</li>
+%% <li>`return_OtpErlangObject' determines whether objects of type OtpErlangObject are returned directly to Erlang (if the option is false), or not.</li>
 %% <li>`call_timeout' sets a timeout value for all calls
 %% to Java from Erlang (default 10 seconds).</li>
 %% </ul>
@@ -224,6 +226,7 @@ start_node(UserOptions) ->
     EnableProxies = proplists:get_value(enable_proxies,Options,false),
     init([{log_level,LogLevel}]),
     CallTimeout = proplists:get_value(call_timeout,Options),
+    ReturnOtpErlangObject = proplists:get_value(return_OtpErlangObject,Options,true),
     SymbolicName = proplists:get_value(symbolic_name,Options,void),
     EnteredClasses = proplists:get_value(enter_classes,Options,[]),
     NodeNode = proplists:get_value(erlang_remote,Options,node()),
@@ -240,6 +243,7 @@ start_node(UserOptions) ->
 	      connect_timeout=ConnectionTimeout,
 	      cookie=Cookie,
 	      enter_classes=EnteredClasses,
+              return_OtpErlangObject=ReturnOtpErlangObject,
 	      ping_retry=PingPongTimeout,
               symbolic_name=SymbolicName},
     spawn_java(PreNode,get_java_node_id()).
@@ -285,7 +289,8 @@ spawn_java(PreNode,PreNodeId) ->
                     JavaOptions,
                     ClassPath,
 		    Cookie,
-                    proplists:get_value(java_class,Options)
+                    proplists:get_value(java_class,Options),
+                    proplists:get_value(return_OtpErlangObject,Options)
                    ]),
             PreNode1 =
                 PreNode#node{node_id=NodeId,
@@ -344,7 +349,7 @@ check_options(Options) ->
 		   false ->
 		       format
 			 (error,
-			  "*** error: option ~p to java:start_node/2 not understood~n",
+			  "*** error: option ~p to java:start_node not understood~n",
 			  [OptionName]),
 		       throw(badarg)
 	       end
@@ -362,7 +367,7 @@ get_java_node_id() ->
     ets:update_counter(java_nodes,java_node_counter,1).
 
 %% @private
-run_java(Identity,NodeName,Name,Executable,Verbose,JavaOptions,Paths,Cookie,Class) ->
+run_java(Identity,NodeName,Name,Executable,Verbose,JavaOptions,Paths,Cookie,Class,ReturnOtpErlangObject) ->
     ClassPath =
         case combine_paths(Paths) of
             "" -> [];
@@ -374,11 +379,13 @@ run_java(Identity,NodeName,Name,Executable,Verbose,JavaOptions,Paths,Cookie,Clas
         if Verbose=/=undefined -> ["-loglevel",Verbose]; true -> [] end,
     JavaOptionsArgs =
         if JavaOptions=/=undefined -> JavaOptions; true -> [] end,
+    ReturnOtpErlangObjectArg =
+        if ReturnOtpErlangObject==true -> []; true -> ["-returnOtpErlangObject"] end,
     Args =
         JavaOptionsArgs++
         ClassPath++
         [Class,NodeName]++
-        VerboseArg++CookieArg,
+        VerboseArg++CookieArg++ReturnOtpErlangObjectArg,
     format
       (info,
        "~p: starting Java node at ~p with command~n~s and args ~p~n",
@@ -440,6 +447,7 @@ connect(NodeName,UserOptions) ->
     PreNode =
         #node
         {node_id=NodeId,
+	 options=Options,
          call_timeout=CallTimeout,
          node_name=NodeName},
     case connectToNode(PreNode) of
@@ -925,13 +933,14 @@ open_db(Init,Options) ->
         undefined ->
             spawn(fun () ->
                           %%io:format("spawned db ~p~n",[self()]),
+		          JavaNodeCounter = rand:uniform(100),
                           try
-			      JavaNodeCounter = rand:uniform(100),
                               ets:new(java_nodes,[named_table,public]),
                               ets:insert(java_nodes,{java_node_counter,JavaNodeCounter}),
                               ets:new(java_classes,[named_table,public]),
                               ets:new(java_threads,[named_table,public]),
-                              ets:new(java_class_ids,[named_table,public]),
+                              ets:new(java_class_ids,[named_table,public]) of
+			    _ -> 
                               wait_until_stable(),
                               if
                                   Init ->
@@ -1269,6 +1278,15 @@ string_to_list(String) ->
     array_to_list(Bytes).
 
 %% @doc
+%% Returns the elements of the Java String as an UTF8 binary.
+-spec string_to_utf8(object_ref()) -> binary().
+string_to_utf8(String) ->
+    UTF8String = list_to_string(node_id(String),"UTF-8"),
+    Bytes = java:call(String,getBytes,[UTF8String]),
+    list_to_binary
+    (lists:map(fun (Byte) -> Byte band 255 end, array_to_list(Bytes))).
+
+%% @doc
 %% Converts the Erlang string argument to a Java string.
 %% This function is for convenience only; it is implementable using
 %% the rest of the Java API.
@@ -1462,6 +1480,13 @@ node_store(Node) ->
 
 %% @private
 find_class(Object) ->
+    case permit_output(get_loglevel(),debug) of
+      true ->
+	java:format
+	  (debug,"find_class(~p)~n",[Object]);
+      false ->
+	ok
+    end,
     ClassId = class_id(Object),
     NodeId = node_id(Object),
     case ets:lookup(java_class_ids,{NodeId,ClassId}) of
